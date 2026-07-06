@@ -1,0 +1,6 @@
+{
+  "name": "AegisID - Enterprise IAM & SSO",
+  "description": "An enterprise-grade Identity & Access Management dashboard featuring multi-factor security, biometric verification, SAML/OIDC SSO, real-time threat detection, and automated user provisioning.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
