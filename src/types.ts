@@ -13,6 +13,10 @@ export interface User {
   department: string;
   lastLogin: string;
   ipAddress: string;
+  // Derived, non-secret enrollment flags surfaced by the server (see sanitizeUser).
+  totpEnrolled?: boolean;
+  totpVerified?: boolean;
+  passkeys?: { id: string; label: string; createdAt: string }[];
 }
 
 export interface SSOApp {
@@ -27,6 +31,9 @@ export interface SSOApp {
   clientSecret?: string;
   scimEnabled: boolean;
   scimEndpoint?: string;
+  // Present on REAL apps (the bundled sample SP): launching opens this URL and
+  // runs an actual SAML SP-initiated SSO flow instead of the simulation.
+  launchUrl?: string;
 }
 
 export interface AuditLog {

@@ -1,15 +1,23 @@
 import express from "express";
 import path from "path";
-import fs from "fs";
 import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
+import { loadDb, saveDb, sanitizeDb, sanitizeUser, defaultDb } from "./server/store";
+import { syncUserToApps } from "./server/scim-client";
+import { totpRouter } from "./server/totp";
+import { webauthnRouter } from "./server/webauthn";
+import { oidcRouter } from "./server/oidc";
+import { authRouter } from "./server/auth";
+import { getSessionUser } from "./server/session";
+import { samlIdpRouter } from "./server/saml-idp";
+import { appsRouter } from "./server/apps";
 
 dotenv.config();
 
-const PORT = 3000;
-const DB_FILE = path.join(process.cwd(), "database.json");
+// Honor the platform-injected port (Cloud Run / AI Studio set PORT); fall back to 3000 locally.
+const PORT = Number(process.env.PORT) || 3000;
 
 // Define Interface Shapes
 interface User {
@@ -72,7 +80,7 @@ const DEFAULT_USERS: User[] = [
     id: "u-1",
     username: "admin.cyber",
     fullName: "Alex Rivera",
-    email: "heliexpertaung@gmail.com", // User's email as bootstrapped admin
+    email: "alex.rivera@enterprise.io", // User's email as bootstrapped admin
     role: "Admin",
     status: "Active",
     assignedApps: ["app-1", "app-2", "app-3", "app-4"],
@@ -270,34 +278,9 @@ const DEFAULT_THREATS: ThreatIncident[] = [
   },
 ];
 
-// Helper to Load & Save Database State
-function loadDb() {
-  try {
-    if (fs.existsSync(DB_FILE)) {
-      const raw = fs.readFileSync(DB_FILE, "utf-8");
-      return JSON.parse(raw);
-    }
-  } catch (err) {
-    console.error("Failed to read database file, generating defaults...", err);
-  }
-
-  const defaultDb = {
-    users: DEFAULT_USERS,
-    apps: DEFAULT_APPS,
-    logs: DEFAULT_LOGS,
-    threats: DEFAULT_THREATS,
-  };
-  saveDb(defaultDb);
-  return defaultDb;
-}
-
-function saveDb(data: any) {
-  try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), "utf-8");
-  } catch (err) {
-    console.error("Failed to write database file:", err);
-  }
-}
+// NOTE: database load/save now lives in ./server/store so the simulated routes
+// below and the real integration routers (totp / webauthn / oidc) all persist
+// to the same database.json.
 
 // Lazy initialization of Google Gemini Client to protect startup
 let geminiClient: GoogleGenAI | null = null;
@@ -329,21 +312,45 @@ async function startServer() {
   const app = express();
   app.use(express.json());
 
-  // API ROUTE: Database Initialization / Reset
-  app.post("/api/db/reset", (req, res) => {
-    const defaultDb = {
-      users: DEFAULT_USERS,
-      apps: DEFAULT_APPS,
-      logs: DEFAULT_LOGS,
-      threats: DEFAULT_THREATS,
-    };
-    saveDb(defaultDb);
-    res.json({ success: true, message: "Database state reset to enterprise defaults.", db: defaultDb });
+  // Shared WebAuthn config (relying-party id + allowed origins) used by both the
+  // passkey enrollment router and the passkey step-up in the auth/login router.
+  const webauthnConfig = {
+    rpID: process.env.WEBAUTHN_RP_ID || "localhost",
+    origins: [
+      process.env.WEBAUTHN_ORIGIN,
+      `http://localhost:${PORT}`,
+      `http://127.0.0.1:${PORT}`,
+    ].filter(Boolean) as string[],
+  };
+
+  // REAL SAML 2.0 Identity Provider (metadata + SSO endpoint). Mounted outside
+  // /api: /saml/sso does its own session check and redirects to login if needed.
+  const idpBaseUrl = process.env.APP_URL && process.env.APP_URL !== "MY_APP_URL"
+    ? process.env.APP_URL
+    : `http://localhost:${PORT}`;
+  const spBaseUrl = process.env.SAMPLE_SP_URL || "http://localhost:3400";
+  app.use("/saml", await samlIdpRouter({ idpBaseUrl, spBaseUrl }));
+
+  // Auth gate: every /api route requires a valid session EXCEPT the login
+  // (/api/auth/*) and OIDC (/api/oidc/*) endpoints, which are how you get one.
+  app.use("/api", (req, res, next) => {
+    const url = req.originalUrl;
+    if (url.startsWith("/api/auth") || url.startsWith("/api/oidc")) return next();
+    if (!getSessionUser(req)) return res.status(401).json({ error: "Authentication required." });
+    next();
   });
 
-  // API ROUTE: Get All Database State
+  // API ROUTE: Database Initialization / Reset
+  app.post("/api/db/reset", (req, res) => {
+    saveDb(defaultDb());
+    // Reload through the store so migrations (e.g. the real sample-SP app) reapply.
+    const db = loadDb();
+    res.json({ success: true, message: "Database state reset to enterprise defaults.", db: sanitizeDb(db) });
+  });
+
+  // API ROUTE: Get All Database State (secrets stripped before leaving the server)
   app.get("/api/db", (req, res) => {
-    res.json(loadDb());
+    res.json(sanitizeDb(loadDb()));
   });
 
   // API ROUTE: Manage Users (Provisioning SCIM Simulation)
@@ -351,7 +358,7 @@ async function startServer() {
     res.json(loadDb().users);
   });
 
-  app.post("/api/users/provision", (req, res) => {
+  app.post("/api/users/provision", async (req, res) => {
     const dbData = loadDb();
     const { fullName, email, role, department, mfaType } = req.body;
 
@@ -369,7 +376,7 @@ async function startServer() {
       email,
       role: role || "Employee",
       status: "Active", // Instantly Active under automated SCIM flow
-      assignedApps: ["app-1", "app-2"], // Default onboarding apps (Slack, AWS)
+      assignedApps: ["app-1", "app-2", "app-5"], // Default onboarding apps (Slack, AWS, Globex)
       mfaEnabled: true,
       mfaType: mfaType || "TOTP",
       biometricRegistered: false,
@@ -394,11 +401,14 @@ async function startServer() {
     };
     dbData.logs.unshift(log);
 
+    // REAL SCIM push: create the account in every live assigned app (Globex).
+    await syncUserToApps(dbData, newUser.assignedApps, newUser, "activate", "onboarding provisioning");
+
     saveDb(dbData);
     res.json({ success: true, user: newUser, log });
   });
 
-  app.post("/api/users/deprovision", (req, res) => {
+  app.post("/api/users/deprovision", async (req, res) => {
     const dbData = loadDb();
     const { userId } = req.body;
 
@@ -408,6 +418,7 @@ async function startServer() {
     }
 
     const user = dbData.users[userIndex];
+    const previousApps = [...user.assignedApps];
     user.status = "Offboarded";
     user.assignedApps = []; // Clear apps
 
@@ -424,11 +435,14 @@ async function startServer() {
     };
     dbData.logs.unshift(log);
 
+    // REAL SCIM push: deactivate the account in every live app the user had.
+    await syncUserToApps(dbData, previousApps, user, "deactivate", "offboarding");
+
     saveDb(dbData);
-    res.json({ success: true, user, log });
+    res.json({ success: true, user: sanitizeUser(user), log });
   });
 
-  app.post("/api/users/update-status", (req, res) => {
+  app.post("/api/users/update-status", async (req, res) => {
     const dbData = loadDb();
     const { userId, status } = req.body;
 
@@ -449,8 +463,16 @@ async function startServer() {
     };
     dbData.logs.unshift(log);
 
+    // REAL SCIM push: suspend deactivates the user's live app accounts;
+    // re-activation restores them.
+    if (status === "Suspended") {
+      await syncUserToApps(dbData, user.assignedApps, user, "deactivate", "account suspended");
+    } else if (status === "Active") {
+      await syncUserToApps(dbData, user.assignedApps, user, "activate", "account re-activated");
+    }
+
     saveDb(dbData);
-    res.json({ success: true, user, log });
+    res.json({ success: true, user: sanitizeUser(user), log });
   });
 
   // API ROUTE: SAML SSO Assertion Handshake Generator
@@ -790,7 +812,8 @@ Requirements for your written Report in Markdown:
 Keep the report formal, highly technical, and completely realistic for an enterprise security team. Return ONLY the report markdown. Do not include markdown wraps like \`\`\`markdown or generic chat preambles.`;
 
       const response = await client.models.generateContent({
-        model: "gemini-3.5-flash",
+        // Overridable via GEMINI_MODEL; defaults to a broadly-available Flash model.
+        model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
         contents: prompt,
       });
 
@@ -803,6 +826,13 @@ Keep the report formal, highly technical, and completely realistic for an enterp
       res.status(500).json({ error: "Gemini report compilation error: " + err.message });
     }
   });
+
+  // --- REAL auth + integration routers ---
+  app.use("/api/auth", authRouter(webauthnConfig)); // login gate (password + MFA step-up)
+  app.use("/api/apps", appsRouter()); // register/remove enterprise apps + user assignment
+  app.use("/api/mfa/totp", totpRouter());
+  app.use("/api/webauthn", webauthnRouter(webauthnConfig));
+  app.use("/api/oidc", oidcRouter());
 
   // VITE DEVELOPMENT MIDDLEWARE OR STATIC FILES
   if (process.env.NODE_ENV !== "production") {

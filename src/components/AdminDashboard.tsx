@@ -1,9 +1,9 @@
 import React, { useState, useEffect } from "react";
-import { 
-  Users, ShieldAlert, Key, ClipboardList, UserPlus, Trash2, 
-  RefreshCw, CheckCircle, AlertTriangle, Play, FileText, 
+import {
+  Users, ShieldAlert, Key, ClipboardList, UserPlus, Trash2,
+  RefreshCw, CheckCircle, AlertTriangle, Play, FileText,
   Search, Shield, Download, Lock, Check, ToggleLeft, ToggleRight,
-  Database, UserCheck, UserX, Cpu, Server, MapPin
+  Database, UserCheck, UserX, Cpu, Server, MapPin, Plus, X, Copy
 } from "lucide-react";
 import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, BarChart, Bar } from "recharts";
 import { User, SSOApp, AuditLog, ThreatIncident } from "../types";
@@ -15,7 +15,6 @@ interface AdminDashboardProps {
   threats: ThreatIncident[];
   onRefresh: () => void;
   triggerMockThreat: (type: string) => void;
-  triggerPushSimulation: (user: User, app: SSOApp) => void;
 }
 
 export default function AdminDashboard({
@@ -25,7 +24,6 @@ export default function AdminDashboard({
   threats,
   onRefresh,
   triggerMockThreat,
-  triggerPushSimulation
 }: AdminDashboardProps) {
   // Tabs: users, threats, apps, logs
   const [activeTab, setActiveTab] = useState<"dashboard" | "users" | "threats" | "apps" | "logs">("dashboard");
@@ -41,6 +39,20 @@ export default function AdminDashboard({
   const [provisionDept, setProvisionDept] = useState("Engineering");
   const [provisionMfa, setProvisionMfa] = useState<any>("TOTP");
   const [provisionSuccess, setProvisionSuccess] = useState(false);
+
+  // Enterprise app registration form (SSO Apps tab)
+  const [showAppForm, setShowAppForm] = useState(false);
+  const [appName, setAppName] = useState("");
+  const [appProtocol, setAppProtocol] = useState<"SAML 2.0" | "OIDC">("SAML 2.0");
+  const [appEntityId, setAppEntityId] = useState("");
+  const [appSsoUrl, setAppSsoUrl] = useState("");
+  const [appScim, setAppScim] = useState(false);
+  const [appScimEndpoint, setAppScimEndpoint] = useState("");
+  const [appRegError, setAppRegError] = useState<string | null>(null);
+  const [appRegResult, setAppRegResult] = useState<{ name: string; clientId?: string; issuedSecret?: string } | null>(null);
+
+  // Per-user application assignment panel (User Directory tab)
+  const [manageAppsUserId, setManageAppsUserId] = useState<string | null>(null);
 
   // Gemini Incident Report State
   const [activeReportThreatId, setActiveReportThreatId] = useState<string | null>(null);
@@ -148,6 +160,68 @@ export default function AdminDashboard({
       console.error(err);
     } finally {
       setRemediatingId(null);
+    }
+  };
+
+  // Register a new enterprise application in the SSO catalog
+  const handleRegisterApp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAppRegError(null);
+    try {
+      const response = await fetch("/api/apps/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: appName,
+          protocol: appProtocol,
+          entityId: appEntityId,
+          ssoUrl: appSsoUrl || undefined,
+          scimEnabled: appScim,
+          scimEndpoint: appScim ? appScimEndpoint : undefined,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        setAppRegError(data.error || "Registration failed.");
+        return;
+      }
+      setAppRegResult({ name: data.app.name, clientId: data.app.clientId, issuedSecret: data.issuedSecret });
+      setAppName(""); setAppEntityId(""); setAppSsoUrl(""); setAppScim(false); setAppScimEndpoint("");
+      setShowAppForm(false);
+      onRefresh();
+    } catch (err) {
+      console.error(err);
+      setAppRegError("Registration failed.");
+    }
+  };
+
+  // Deregister an application (revokes it from every user)
+  const handleRemoveApp = async (appId: string, name: string) => {
+    if (!window.confirm(`Deregister "${name}"? This removes the federation trust and revokes access for every assigned user.`)) return;
+    try {
+      const response = await fetch("/api/apps/remove", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ appId }),
+      });
+      if (response.ok) onRefresh();
+      else alert((await response.json()).error || "Could not remove app.");
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  // Toggle a user's access to an application
+  const handleToggleAssign = async (userId: string, appId: string, assigned: boolean) => {
+    try {
+      const response = await fetch("/api/apps/assign", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId, appId, assigned }),
+      });
+      if (response.ok) onRefresh();
+    } catch (err) {
+      console.error(err);
     }
   };
 
@@ -560,6 +634,48 @@ export default function AdminDashboard({
             </div>
           )}
 
+          {/* Per-User Application Assignment Panel */}
+          {manageAppsUserId && (() => {
+            const mu = users.find((u) => u.id === manageAppsUserId);
+            if (!mu) return null;
+            return (
+              <div className="mb-6 p-5 bg-zinc-50 border border-zinc-200 rounded-xl">
+                <div className="flex items-center justify-between mb-3">
+                  <div>
+                    <h4 className="text-xs font-bold text-zinc-800 uppercase tracking-wider flex items-center gap-1.5">
+                      <Key className="w-3.5 h-3.5 text-indigo-500" />
+                      Application Access — {mu.fullName}
+                    </h4>
+                    <p className="text-[10px] text-zinc-500 mt-0.5">Toggle entitlements below. Changes appear in the user's MyApps launcher immediately.</p>
+                  </div>
+                  <button onClick={() => setManageAppsUserId(null)} className="p-1 text-zinc-400 hover:text-zinc-700 rounded" title="Close">
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {apps.map((app) => {
+                    const on = mu.assignedApps.includes(app.id);
+                    return (
+                      <button
+                        key={app.id}
+                        onClick={() => handleToggleAssign(mu.id, app.id, !on)}
+                        className={`px-3 py-1.5 rounded-lg text-[11px] font-semibold border flex items-center gap-1.5 transition-colors ${
+                          on
+                            ? "bg-emerald-50 border-emerald-300 text-emerald-800 hover:bg-emerald-100"
+                            : "bg-white border-zinc-200 text-zinc-500 hover:border-zinc-400 hover:text-zinc-800"
+                        }`}
+                      >
+                        {on ? <CheckCircle className="w-3.5 h-3.5 text-emerald-500" /> : <Plus className="w-3.5 h-3.5" />}
+                        {app.name}
+                        <span className="text-[8px] font-mono text-zinc-400">{app.protocol}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })()}
+
           {/* Directory Spreadsheet Grid */}
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs text-zinc-600">
@@ -615,6 +731,17 @@ export default function AdminDashboard({
                     </td>
                     <td className="py-3 text-right">
                       <div className="flex justify-end gap-2">
+                        {user.status !== "Offboarded" && (
+                          <button
+                            onClick={() => setManageAppsUserId(manageAppsUserId === user.id ? null : user.id)}
+                            className={`p-1 rounded transition-colors ${
+                              manageAppsUserId === user.id ? "bg-indigo-100 text-indigo-700" : "text-indigo-600 hover:bg-indigo-50"
+                            }`}
+                            title="Manage application access"
+                          >
+                            <Key className="w-4 h-4" />
+                          </button>
+                        )}
                         {user.status === "Active" && (
                           <button
                             onClick={() => handleUpdateUserStatus(user.id, "Suspended")}
@@ -777,10 +904,94 @@ export default function AdminDashboard({
       {/* SSO Applications Configuration Tab */}
       {activeTab === "apps" && (
         <div className="bg-white border border-zinc-200 p-6 rounded-2xl shadow-sm animate-fade-in flex flex-col gap-6">
-          <div>
-            <h3 className="text-base font-bold text-zinc-900">Enterprise Applications Directory</h3>
-            <p className="text-xs text-zinc-500 mt-0.5">Integrate Slack, AWS, Zoom, and Salesforce with SSO (SAML 2.0 / OIDC) and SCIM synchronization protocols.</p>
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h3 className="text-base font-bold text-zinc-900">Enterprise Applications Directory</h3>
+              <p className="text-xs text-zinc-500 mt-0.5">Integrate Slack, AWS, Zoom, and Salesforce with SSO (SAML 2.0 / OIDC) and SCIM synchronization protocols.</p>
+            </div>
+            <button
+              onClick={() => { setShowAppForm(!showAppForm); setAppRegResult(null); setAppRegError(null); }}
+              className="py-2 px-4 bg-zinc-950 hover:bg-zinc-800 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow transition-all focus:outline-none"
+            >
+              <Plus className="w-4 h-4" />
+              Register New App
+            </button>
           </div>
+
+          {/* One-time credential banner (OIDC secrets are never shown again) */}
+          {appRegResult && (
+            <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-800">
+              <div className="font-bold flex items-center gap-1.5 uppercase tracking-wider">
+                <CheckCircle className="w-4 h-4 text-emerald-500" />
+                {appRegResult.name} registered — federation trust established
+              </div>
+              {appRegResult.clientId && (
+                <div className="mt-2 font-mono text-[11px] flex flex-col gap-1">
+                  <span>client_id: <strong className="select-all">{appRegResult.clientId}</strong></span>
+                  <span className="flex items-center gap-1.5">
+                    client_secret: <strong className="select-all">{appRegResult.issuedSecret}</strong>
+                    <button onClick={() => navigator.clipboard?.writeText(appRegResult.issuedSecret || "")} className="text-emerald-600 hover:text-emerald-800" title="Copy secret">
+                      <Copy className="w-3 h-3" />
+                    </button>
+                  </span>
+                  <span className="text-[10px] text-emerald-600">Store the secret now — it is shown only once and never re-exposed by the API.</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Registration Form */}
+          {showAppForm && (
+            <div className="p-5 bg-zinc-50 border border-zinc-200 rounded-xl">
+              <h4 className="text-xs font-bold text-zinc-800 uppercase tracking-wider mb-3">Federation Trust Registration</h4>
+              <form onSubmit={handleRegisterApp} className="grid grid-cols-1 md:grid-cols-12 gap-4">
+                <div className="md:col-span-3">
+                  <label className="block text-[10px] uppercase font-bold text-zinc-500 tracking-wider mb-1">App Name</label>
+                  <input type="text" required value={appName} onChange={(e) => setAppName(e.target.value)} placeholder="Zoom Enterprise"
+                    className="w-full text-xs p-2 bg-white border border-zinc-200 rounded-md outline-none focus:ring-1 focus:ring-zinc-950" />
+                </div>
+                <div className="md:col-span-2">
+                  <label className="block text-[10px] uppercase font-bold text-zinc-500 tracking-wider mb-1">Protocol</label>
+                  <select value={appProtocol} onChange={(e) => setAppProtocol(e.target.value as any)}
+                    className="w-full text-xs p-2 bg-white border border-zinc-200 rounded-md outline-none focus:ring-1 focus:ring-zinc-950">
+                    <option value="SAML 2.0">SAML 2.0</option>
+                    <option value="OIDC">OIDC</option>
+                  </select>
+                </div>
+                <div className="md:col-span-4">
+                  <label className="block text-[10px] uppercase font-bold text-zinc-500 tracking-wider mb-1">Entity ID / Audience</label>
+                  <input type="text" required value={appEntityId} onChange={(e) => setAppEntityId(e.target.value)} placeholder="https://zoom.us/saml2/metadata"
+                    className="w-full text-xs p-2 bg-white border border-zinc-200 rounded-md outline-none focus:ring-1 focus:ring-zinc-950 font-mono" />
+                </div>
+                <div className="md:col-span-3">
+                  <label className="block text-[10px] uppercase font-bold text-zinc-500 tracking-wider mb-1">ACS / SSO URL (optional)</label>
+                  <input type="text" value={appSsoUrl} onChange={(e) => setAppSsoUrl(e.target.value)} placeholder="auto-generated if empty"
+                    className="w-full text-xs p-2 bg-white border border-zinc-200 rounded-md outline-none focus:ring-1 focus:ring-zinc-950 font-mono" />
+                </div>
+                <div className="md:col-span-4 flex items-center gap-2">
+                  <button type="button" onClick={() => setAppScim(!appScim)} className="focus:outline-none" title="Toggle SCIM provisioning">
+                    {appScim ? <ToggleRight className="w-6 h-6 text-emerald-500" /> : <ToggleLeft className="w-6 h-6 text-zinc-300" />}
+                  </button>
+                  <span className="text-[10px] text-zinc-600 uppercase tracking-wider font-semibold">SCIM auto-provisioning</span>
+                  {appScim && (
+                    <input type="text" value={appScimEndpoint} onChange={(e) => setAppScimEndpoint(e.target.value)} placeholder="https://api.app.com/scim/v2"
+                      className="flex-1 text-xs p-2 bg-white border border-zinc-200 rounded-md outline-none focus:ring-1 focus:ring-zinc-950 font-mono" />
+                  )}
+                </div>
+                <div className="md:col-span-8 flex items-end justify-end gap-2">
+                  {appRegError && <span className="text-[11px] text-rose-600 font-semibold self-center mr-auto">{appRegError}</span>}
+                  <button type="button" onClick={() => setShowAppForm(false)}
+                    className="py-2 px-4 bg-white hover:bg-zinc-100 border border-zinc-200 text-zinc-600 rounded-md text-xs font-semibold transition-colors">
+                    Cancel
+                  </button>
+                  <button type="submit"
+                    className="py-2 px-4 bg-zinc-950 hover:bg-zinc-800 text-white rounded-md text-xs font-semibold transition-colors">
+                    Establish Federation Trust
+                  </button>
+                </div>
+              </form>
+            </div>
+          )}
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             {apps.map((app) => (
@@ -825,13 +1036,21 @@ export default function AdminDashboard({
                     {app.scimEnabled ? <ToggleRight className="w-5 h-5 text-emerald-500 cursor-pointer" /> : <ToggleLeft className="w-5 h-5 text-zinc-300 cursor-pointer" />}
                     <span className="text-[10px] text-zinc-500 uppercase tracking-wider font-semibold">SCIM Onboarding Sync</span>
                   </div>
-                  
-                  <button 
-                    onClick={() => setActiveTab("logs")}
-                    className="text-[9px] hover:underline text-indigo-600 uppercase tracking-wider font-bold"
-                  >
-                    View SAML XML Certificate
-                  </button>
+
+                  <div className="flex items-center gap-2.5">
+                    <span className="text-[9px] text-zinc-400 font-mono">
+                      {users.filter((u) => u.assignedApps.includes(app.id)).length} users
+                    </span>
+                    {!app.launchUrl && (
+                      <button
+                        onClick={() => handleRemoveApp(app.id, app.name)}
+                        className="p-1 text-rose-500 hover:bg-rose-50 rounded transition-colors"
+                        title="Deregister application"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             ))}

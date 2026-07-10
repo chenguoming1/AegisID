@@ -5,10 +5,15 @@ import {
 } from "lucide-react";
 import { User as UserType, SSOApp, SAMLHandshakeResponse } from "../types";
 
+interface PushHandlers {
+  onApprove?: (data: SAMLHandshakeResponse) => void;
+  onReject?: () => void;
+}
+
 interface EndUserVaultProps {
   currentUser: UserType;
   apps: SSOApp[];
-  onTriggerPush: (app: SSOApp) => void;
+  onTriggerPush: (app: SSOApp, handlers: PushHandlers) => void;
   onRefresh: () => void;
 }
 
@@ -22,24 +27,51 @@ export default function EndUserVault({
   const [authenticating, setAuthenticating] = useState(false);
   const [ssoResponse, setSsoResponse] = useState<SAMLHandshakeResponse | null>(null);
   const [showAssertionXml, setShowAssertionXml] = useState(false);
+  // Push MFA resolves on the Mobile Emulator, so we can't pop a blocking overlay
+  // (it would hide the phone). Track the wait/denied states inline instead.
+  const [waitingForPush, setWaitingForPush] = useState<SSOApp | null>(null);
+  const [pushDenied, setPushDenied] = useState(false);
 
   // Filter apps assigned to this user
   const assignedApps = apps.filter(app => currentUser.assignedApps.includes(app.id));
 
   // Handle single sign-on assertion generation
   const handleSSOLaunch = async (app: SSOApp) => {
-    setSelectedApp(app);
-    setAuthenticating(true);
     setSsoResponse(null);
     setShowAssertionXml(false);
+    setPushDenied(false);
 
-    // If app protocol requires Push notification, request authorization first
-    if (currentUser.mfaType === "Push") {
-      onTriggerPush(app);
+    // REAL apps (the bundled sample SP): open the app itself — it will run a
+    // genuine SAML SP-initiated SSO flow back through this IdP.
+    if (app.launchUrl) {
+      window.open(app.launchUrl, "_blank", "noopener");
       return;
     }
 
-    // Direct authentications (like Biometric/TOTP simulation)
+    // Push MFA: approval happens on the Mobile Emulator. Keep the phone reachable by
+    // showing a non-blocking inline "waiting" state instead of the full-screen modal.
+    // Once the remote biometric handshake resolves, surface the signed assertion.
+    if (currentUser.mfaType === "Push") {
+      setWaitingForPush(app);
+      onTriggerPush(app, {
+        onApprove: (data) => {
+          setWaitingForPush(null);
+          if (data?.success) {
+            setSelectedApp(app);
+            setSsoResponse(data);
+          }
+        },
+        onReject: () => {
+          setWaitingForPush(null);
+          setPushDenied(true);
+        },
+      });
+      return;
+    }
+
+    // Direct authentications (Biometric / TOTP / SMS simulation) open the modal directly.
+    setSelectedApp(app);
+    setAuthenticating(true);
     await executeSSOAssertion(app);
   };
 
@@ -66,6 +98,7 @@ export default function EndUserVault({
     setSelectedApp(null);
     setSsoResponse(null);
     setAuthenticating(false);
+    setWaitingForPush(null);
     onRefresh();
   };
 
@@ -105,21 +138,62 @@ export default function EndUserVault({
           <p className="text-xs text-zinc-500 mt-0.5">Click any application launcher card below to issue secure Single Sign-On handshake.</p>
         </div>
 
+        {/* Push MFA: non-blocking wait banner so the Mobile Emulator stays reachable */}
+        {waitingForPush && (
+          <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-3 animate-fade-in">
+            <RefreshCw className="w-4 h-4 text-amber-500 shrink-0 mt-0.5 animate-spin" />
+            <div>
+              <p className="text-xs font-bold text-amber-800 uppercase tracking-wider">Push Sent • Awaiting Approval</p>
+              <p className="text-[11px] text-amber-700 mt-0.5 leading-normal">
+                A login request for <strong>{waitingForPush.name}</strong> was pushed to your device. Approve it with your
+                fingerprint on the <strong>Mobile MFA Emulator</strong> to complete the SSO handshake.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Push denied feedback */}
+        {pushDenied && (
+          <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-xl flex items-start gap-3 animate-fade-in">
+            <Lock className="w-4 h-4 text-rose-500 shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <p className="text-xs font-bold text-rose-800 uppercase tracking-wider">SSO Access Denied</p>
+              <p className="text-[11px] text-rose-700 mt-0.5 leading-normal">
+                The federated login was rejected from the mobile authenticator. No SAML assertion was issued.
+              </p>
+            </div>
+            <button
+              onClick={() => setPushDenied(false)}
+              className="text-[10px] font-mono text-rose-600 hover:text-rose-800 uppercase focus:outline-none"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
         {assignedApps.length > 0 ? (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             {assignedApps.map((app) => (
               <button
                 key={app.id}
                 onClick={() => handleSSOLaunch(app)}
-                className="group border border-zinc-200 hover:border-zinc-400 rounded-xl p-5 text-left transition-all hover:shadow-sm flex flex-col justify-between gap-6 min-h-[160px] bg-white outline-none focus:ring-2 focus:ring-zinc-900"
+                disabled={!!waitingForPush}
+                className="group border border-zinc-200 hover:border-zinc-400 rounded-xl p-5 text-left transition-all hover:shadow-sm flex flex-col justify-between gap-6 min-h-[160px] bg-white outline-none focus:ring-2 focus:ring-zinc-900 disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:border-zinc-200 disabled:hover:shadow-none"
               >
                 <div className="flex justify-between items-start w-full">
                   <div className="p-2.5 bg-zinc-100 group-hover:bg-zinc-200 rounded-xl transition-colors font-mono font-bold text-zinc-800 uppercase text-xs">
                     {app.name.slice(0, 2)}
                   </div>
-                  <span className="text-[10px] bg-zinc-100 text-zinc-600 font-mono px-2 py-0.5 rounded font-medium border border-zinc-150">
-                    {app.protocol}
-                  </span>
+                  <div className="flex items-center gap-1.5">
+                    {app.launchUrl && (
+                      <span className="text-[9px] bg-emerald-500 text-white font-mono px-2 py-0.5 rounded font-bold uppercase tracking-wider animate-pulse">
+                        ● Live
+                      </span>
+                    )}
+                    <span className="text-[10px] bg-zinc-100 text-zinc-600 font-mono px-2 py-0.5 rounded font-medium border border-zinc-150">
+                      {app.protocol}
+                    </span>
+                  </div>
                 </div>
 
                 <div className="w-full">

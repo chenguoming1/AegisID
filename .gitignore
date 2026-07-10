@@ -6,3 +6,15 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Runtime-generated local database store
+database.json
+
+# Editor/tooling scratch
+.claude/
+
+# SAML IdP signing keys (generated at first boot)
+saml-keys.json
+
+# Globex sample-app SCIM directory (runtime)
+globex-directory.json
